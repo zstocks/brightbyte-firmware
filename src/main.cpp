@@ -1,8 +1,12 @@
 #include <Arduino.h>
 #include <FastLED.h>
 #include <FastLED_NeoMatrix.h>
+#include <WebServer.h>
+#include <WiFi.h>
+#include <time.h>
 
 #include "icons.h"
+#include "secrets.h"  // WIFI_SSID and WIFI_PASSWORD; not committed to Git
 
 // ---------- Hardware ----------
 const int DATA_PIN = 13;
@@ -34,15 +38,19 @@ const unsigned long FRAME_MS = 50;
 unsigned long lastFrame = 0;
 int scrollX = WIDTH;
 
-// ---------- Temporary clock ----------
-// Until Wi-Fi arrives in Phase 3b, the clock counts up from a time
-// you set with the "time" command.
-int clockBaseMinutes = 12 * 60;
-unsigned long clockBaseMillis = 0;
+// ---------- Wi-Fi and time ----------
+// US Mountain time with daylight saving rules, in POSIX format.
+const char* TIMEZONE = "MST7MDT,M3.2.0,M11.1.0";
+const char* TIME_SERVER = "pool.ntp.org";
 
+WebServer server(80);
+bool wifiReady = false;
+
+// Minutes since local midnight, or -1 if the time isn't known yet.
 int minutesNow() {
-  unsigned long elapsed = (millis() - clockBaseMillis) / 60000UL;
-  return (clockBaseMinutes + (int)(elapsed % 1440UL)) % 1440;
+  struct tm now;
+  if (!getLocalTime(&now, 0)) return -1;
+  return now.tm_hour * 60 + now.tm_min;
 }
 
 // ---------- Drawing helpers ----------
@@ -98,6 +106,10 @@ void drawMessage() {
 void drawClock() {
   uint16_t color = matrix.Color(state.r, state.g, state.b);
   int minutes = minutesNow();
+  if (minutes < 0) {
+    drawText("--:--", 1, color);  // time not synced yet
+    return;
+  }
   int hour24 = minutes / 60;
   int minute = minutes % 60;
   int hour12 = hour24 % 12;
@@ -153,7 +165,7 @@ void printHelp() {
   Serial.println("  icon <name>    show an icon beside the message (icon none to remove)");
   Serial.println("  icons          list icon names");
   Serial.println("  clock          show the clock");
-  Serial.println("  time <HH:MM>   set the temporary clock, 24-hour (time 14:05)");
+  Serial.println("  wifi           show connection status and IP address");
   Serial.println("  dark           turn the display off");
 }
 
@@ -204,16 +216,14 @@ void handleCommand(String line) {
     return;
   } else if (command == "clock") {
     state.mode = MODE_CLOCK;
-  } else if (command == "time") {
-    int colon = argument.indexOf(':');
-    int hour = (colon < 0) ? -1 : argument.substring(0, colon).toInt();
-    int minute = (colon < 0) ? -1 : argument.substring(colon + 1).toInt();
-    if (hour < 0 || hour > 23 || minute < 0 || minute > 59) {
-      Serial.println("Use 24-hour HH:MM, for example: time 14:05");
-      return;
+  } else if (command == "wifi") {
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.print("Connected. Open http://");
+      Serial.println(WiFi.localIP());
+    } else {
+      Serial.println("Not connected.");
     }
-    clockBaseMinutes = hour * 60 + minute;
-    clockBaseMillis = millis();
+    return;
   } else if (command == "dark") {
     state.mode = MODE_DARK;
   } else {
@@ -237,6 +247,36 @@ void readSerial() {
   }
 }
 
+// ---------- Local web test ----------
+// A tiny web server so you can check the sign from a browser on the
+// same network. The VPS connection replaces this in Phase 5.
+void handleRoot() {
+  server.send(200, "text/plain",
+              "The sign is alive.\nTry /msg?text=Hello to change the message.");
+}
+
+void handleMsg() {
+  if (!server.hasArg("text")) {
+    server.send(400, "text/plain", "Add ?text=something");
+    return;
+  }
+  handleCommand(String("msg ") + server.arg("text"));
+  server.send(200, "text/plain", "ok");
+}
+
+// Runs every loop. The first time Wi-Fi comes up, start the clock
+// sync and the web server.
+void checkWifi() {
+  if (wifiReady || WiFi.status() != WL_CONNECTED) return;
+  wifiReady = true;
+  configTzTime(TIMEZONE, TIME_SERVER);
+  server.on("/", handleRoot);
+  server.on("/msg", handleMsg);
+  server.begin();
+  Serial.print("Wi-Fi connected. Open http://");
+  Serial.println(WiFi.localIP());
+}
+
 // ---------- Main program ----------
 void setup() {
   Serial.begin(115200);
@@ -246,10 +286,17 @@ void setup() {
   matrix.setBrightness(20);
   matrix.setTextWrap(false);
   printHelp();
+
+  // Start connecting and carry on. checkWifi() notices when it's up.
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.println("Connecting to Wi-Fi...");
 }
 
 void loop() {
   readSerial();
+  checkWifi();
+  if (wifiReady) server.handleClient();
 
   // Redraw 20 times a second without blocking, so the sign
   // keeps listening for commands between frames.
