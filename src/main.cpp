@@ -1,12 +1,15 @@
 #include <Arduino.h>
+#include <ArduinoJson.h>
 #include <FastLED.h>
 #include <FastLED_NeoMatrix.h>
-#include <WebServer.h>
+#include <Preferences.h>
+#include <WebSocketsClient.h>
 #include <WiFi.h>
 #include <time.h>
 
+#include "certs.h"
 #include "icons.h"
-#include "secrets.h"  // WIFI_SSID and WIFI_PASSWORD; not committed to Git
+#include "secrets.h"  // Wi-Fi and server credentials; not committed to Git
 
 // ---------- Hardware ----------
 const int DATA_PIN = 13;
@@ -21,7 +24,7 @@ FastLED_NeoMatrix matrix(leds, WIDTH, HEIGHT,
 
 // ---------- Display state ----------
 // Everything the sign needs to know to draw itself.
-// Later, the VPS will send exactly this over the WebSocket.
+// The server sends exactly this over the WebSocket.
 enum Mode { MODE_MESSAGE, MODE_CLOCK, MODE_DARK };
 
 struct DisplayState {
@@ -43,8 +46,12 @@ int scrollX = WIDTH;
 const char* TIMEZONE = "MST7MDT,M3.2.0,M11.1.0";
 const char* TIME_SERVER = "pool.ntp.org";
 
-WebServer server(80);
 bool wifiReady = false;
+
+// ---------- Server connection ----------
+WebSocketsClient socket;
+bool serverConnected = false;
+Preferences prefs;  // small key-value store in flash memory
 
 // Minutes since local midnight, or -1 if the time isn't known yet.
 int minutesNow() {
@@ -165,7 +172,7 @@ void printHelp() {
   Serial.println("  icon <name>    show an icon beside the message (icon none to remove)");
   Serial.println("  icons          list icon names");
   Serial.println("  clock          show the clock");
-  Serial.println("  wifi           show connection status and IP address");
+  Serial.println("  status         show Wi-Fi and server connection status");
   Serial.println("  dark           turn the display off");
 }
 
@@ -216,13 +223,9 @@ void handleCommand(String line) {
     return;
   } else if (command == "clock") {
     state.mode = MODE_CLOCK;
-  } else if (command == "wifi") {
-    if (WiFi.status() == WL_CONNECTED) {
-      Serial.print("Connected. Open http://");
-      Serial.println(WiFi.localIP());
-    } else {
-      Serial.println("Not connected.");
-    }
+  } else if (command == "status") {
+    Serial.println(WiFi.status() == WL_CONNECTED ? "Wi-Fi: connected" : "Wi-Fi: not connected");
+    Serial.println(serverConnected ? "Server: connected" : "Server: not connected");
     return;
   } else if (command == "dark") {
     state.mode = MODE_DARK;
@@ -247,34 +250,91 @@ void readSerial() {
   }
 }
 
-// ---------- Local web test ----------
-// A tiny web server so you can check the sign from a browser on the
-// same network. The VPS connection replaces this in Phase 5.
-void handleRoot() {
-  server.send(200, "text/plain",
-              "The sign is alive.\nTry /msg?text=Hello to change the message.");
+// ---------- Messages from the server ----------
+// Applies a state message such as:
+//   {"type":"state","state":{"mode":"message","text":"Busy",
+//                            "color":"#ff1e1e","icon":"dnd"}}
+// Returns false and changes nothing if the message isn't valid.
+bool applyStateJson(const char* json, size_t length) {
+  JsonDocument doc;
+  if (deserializeJson(doc, json, length)) return false;
+  if (strcmp(doc["type"] | "", "state") != 0) return false;
+
+  JsonObject incoming = doc["state"];
+  const char* mode = incoming["mode"] | "";
+  const char* color = incoming["color"] | "";
+  const char* icon = incoming["icon"] | "";  // null arrives as ""
+
+  DisplayState next = state;
+  if (strcmp(mode, "message") == 0) {
+    next.mode = MODE_MESSAGE;
+  } else if (strcmp(mode, "clock") == 0) {
+    next.mode = MODE_CLOCK;
+  } else if (strcmp(mode, "dark") == 0) {
+    next.mode = MODE_DARK;
+  } else {
+    return false;
+  }
+
+  next.text = incoming["text"] | "";
+  next.icon = findIcon(icon);  // -1 when there is no icon
+
+  // Color arrives as "#rrggbb".
+  if (strlen(color) == 7 && color[0] == '#') {
+    long value = strtol(color + 1, nullptr, 16);
+    next.r = (value >> 16) & 0xFF;
+    next.g = (value >> 8) & 0xFF;
+    next.b = value & 0xFF;
+  }
+
+  // Restart scrolling only when what's on screen actually changes.
+  if (next.mode != state.mode || next.text != state.text || next.icon != state.icon) {
+    scrollX = WIDTH;
+  }
+  state = next;
+  return true;
 }
 
-void handleMsg() {
-  if (!server.hasArg("text")) {
-    server.send(400, "text/plain", "Add ?text=something");
+void handleServerMessage(const char* json, size_t length) {
+  if (!applyStateJson(json, length)) {
+    Serial.println("Ignored a message from the server.");
     return;
   }
-  handleCommand(String("msg ") + server.arg("text"));
-  server.send(200, "text/plain", "ok");
+  // Remember the state so it survives a power cut. Flash memory wears
+  // out with writes, so only save when something changed.
+  String latest = String(json);
+  if (latest != prefs.getString("state", "")) {
+    prefs.putString("state", latest);
+  }
+}
+
+void onSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
+  if (type == WStype_CONNECTED) {
+    serverConnected = true;
+    Serial.println("Server connected.");
+  } else if (type == WStype_DISCONNECTED) {
+    if (serverConnected) Serial.println("Server disconnected. Retrying...");
+    serverConnected = false;
+  } else if (type == WStype_TEXT) {
+    handleServerMessage((const char*)payload, length);
+  }
 }
 
 // Runs every loop. The first time Wi-Fi comes up, start the clock
-// sync and the web server.
+// sync and open the connection to the server.
 void checkWifi() {
   if (wifiReady || WiFi.status() != WL_CONNECTED) return;
   wifiReady = true;
+  Serial.println("Wi-Fi connected.");
   configTzTime(TIMEZONE, TIME_SERVER);
-  server.on("/", handleRoot);
-  server.on("/msg", handleMsg);
-  server.begin();
-  Serial.print("Wi-Fi connected. Open http://");
-  Serial.println(WiFi.localIP());
+
+  String path = String("/device?sign=") + SIGN_ID;
+  String header = String("Authorization: Bearer ") + DEVICE_TOKEN;
+  socket.beginSslWithCA(SERVER_HOST, 443, path.c_str(), ROOT_CA_CERTS);
+  socket.setExtraHeaders(header.c_str());
+  socket.onEvent(onSocketEvent);
+  socket.setReconnectInterval(5000);       // retry every 5 seconds
+  socket.enableHeartbeat(15000, 3000, 2);  // notice a dead connection
 }
 
 // ---------- Main program ----------
@@ -287,6 +347,11 @@ void setup() {
   matrix.setTextWrap(false);
   printHelp();
 
+  // Show whatever the sign was showing before it lost power.
+  prefs.begin("sign", false);
+  String saved = prefs.getString("state", "");
+  if (saved.length() > 0) applyStateJson(saved.c_str(), saved.length());
+
   // Start connecting and carry on. checkWifi() notices when it's up.
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
@@ -296,7 +361,7 @@ void setup() {
 void loop() {
   readSerial();
   checkWifi();
-  if (wifiReady) server.handleClient();
+  if (wifiReady) socket.loop();
 
   // Redraw 20 times a second without blocking, so the sign
   // keeps listening for commands between frames.
